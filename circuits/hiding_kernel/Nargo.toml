@@ -1,0 +1,8 @@
+[package]
+name = "hiding_kernel"
+type = "bin"
+authors = [""]
+compiler_version = ">=0.36.0"
+
+[dependencies]
+ivc_types = { path = "../ivc_types" }

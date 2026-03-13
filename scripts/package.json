@@ -1,0 +1,16 @@
+{
+  "name": "mini-rollup-scripts",
+  "type": "module",
+  "scripts": {
+    "prove": "tsx prove_e2e.ts"
+  },
+  "dependencies": {
+    "@aztec/bb.js": "4.0.0-devnet.2-patch.1",
+    "@aztec/noir-noir_js": "4.0.0-devnet.2-patch.1",
+    "tsx": "^4.20.6"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.0.0"
+  }
+}
