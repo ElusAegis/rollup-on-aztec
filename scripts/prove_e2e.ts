@@ -1,14 +1,14 @@
 /**
- * Mini ZK-Rollup Proof Pipeline (IVC Chain)
+ * Mini ZK-Rollup Proof Pipeline
  *
- * 4-circuit IVC chain proved with Chonk, then verified in UltraHonk tube:
- * 1. batch_app: verifies 10 UltraHonk client proofs (app circuit)
- * 2. init_kernel: OINK verification (IVC kernel)
- * 3. tail_kernel: HN_TAIL verification (IVC kernel)
- * 4. hiding_kernel: HN_FINAL verification (IVC kernel)
- * 5. tube: verifies Chonk proof → UltraHonk (for Aztec contract)
+ * Two proving modes:
+ *   ivc   – 4-circuit IVC chain proved with Chonk, then UltraHonk tube (default)
+ *   naive – Direct batch verification in a single UltraHonk circuit
  *
- * Usage: cd scripts && yarn install && yarn prove
+ * Usage: yarn prove [ivc|naive]
+ *
+ * Wrap with `/usr/bin/time -l` for accurate peak RSS and CPU usage —
+ * Node.js process.memoryUsage() cannot see WASM memory.
  */
 
 import { Noir } from '@aztec/noir-noir_js';
@@ -19,17 +19,36 @@ import {
   deflattenFields,
 } from '@aztec/bb.js';
 import { ungzip } from 'pako';
-import { readFileSync } from 'fs';
+import { readFileSync, writeFileSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { cpus, totalmem, platform, arch, hostname } from 'os';
+import { Contract } from '@aztec/aztec.js/contracts';
+import { loadContractArtifact } from '@aztec/aztec.js/abi';
+import { createAztecNodeClient, waitForNode } from '@aztec/aztec.js/node';
+import { NodeEmbeddedWallet } from '@aztec/wallets/embedded';
+import {
+  registerInitialLocalNetworkAccountsInWallet,
+} from '@aztec/wallets/testing';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+
+type Mode = 'ivc' | 'naive';
+
+interface ProofResult {
+  vkFields: string[];
+  vkHash: string;
+  proofFields: string[];
+  publicInputs: string[];
+}
+
+const SANDBOX_URL = 'http://localhost:8080';
 
 // ─── Helpers ───────────────────────────────────────────────────────────
 
 function loadCircuit(dir: string, name: string) {
-  const circuitPath = resolve(__dirname, `../circuits/${dir}/target/${name}.json`);
-  return JSON.parse(readFileSync(circuitPath, 'utf-8'));
+  const p = resolve(__dirname, `../circuits/${dir}/target/${name}.json`);
+  return JSON.parse(readFileSync(p, 'utf-8'));
 }
 
 function fieldToHex(field: Uint8Array): string {
@@ -46,256 +65,539 @@ function hexToBytes(hex: string): Uint8Array {
   return bytes;
 }
 
-// ─── Main Pipeline ─────────────────────────────────────────────────────
+// ─── Telemetry ────────────────────────────────────────────────────────
+
+interface PhaseEntry {
+  phase: string;
+  durationMs: number;
+}
+
+interface SystemInfo {
+  platform: string;
+  arch: string;
+  hostname: string;
+  cpuModel: string;
+  cpuCores: number;
+  totalMemMb: number;
+  nodeVersion: string;
+}
+
+function getSystemInfo(): SystemInfo {
+  const cpuList = cpus();
+  return {
+    platform: platform(),
+    arch: arch(),
+    hostname: hostname(),
+    cpuModel: cpuList[0]?.model ?? 'unknown',
+    cpuCores: cpuList.length,
+    totalMemMb: Math.round(totalmem() / (1024 * 1024)),
+    nodeVersion: process.version,
+  };
+}
+
+const phases: PhaseEntry[] = [];
+
+async function timed<T>(phase: string, fn: () => Promise<T>): Promise<T> {
+  const t0 = performance.now();
+  const result = await fn();
+  const elapsed = performance.now() - t0;
+  phases.push({ phase, durationMs: elapsed });
+  console.log(`  [${fmtDur(elapsed)}] ${phase}`);
+  return result;
+}
+
+function fmtB(bytes: number): string {
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  if (bytes < 1024 * 1024 * 1024) {
+    return `${(bytes / (1024 * 1024)).toFixed(0)} MB`;
+  }
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
+function fmtDur(ms: number): string {
+  if (ms < 1000) return `${ms.toFixed(0)}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  const min = Math.floor(ms / 60_000);
+  const sec = ((ms % 60_000) / 1000).toFixed(1);
+  return `${min}m ${sec}s`;
+}
+
+function printSummary(mode: Mode, sysInfo: SystemInfo) {
+  const totalMs = phases.reduce((s, p) => s + p.durationMs, 0);
+
+  const W = 64;
+  const sep = '='.repeat(W);
+  const dash = '-'.repeat(W - 4);
+
+  console.log(`\n${sep}`);
+  console.log(`  Benchmark Summary (${mode.toUpperCase()} mode)`);
+  console.log(
+    `  ${sysInfo.platform}/${sysInfo.arch} | ${sysInfo.cpuModel.trim()}` +
+    ` (${sysInfo.cpuCores} cores) | ${fmtB(sysInfo.totalMemMb * 1024 * 1024)} RAM` +
+    ` | ${sysInfo.nodeVersion}`,
+  );
+  console.log(sep);
+  console.log(`  ${'Phase'.padEnd(40)} ${'Duration'.padStart(12)}`);
+  console.log(`  ${dash}`);
+
+  for (const p of phases) {
+    console.log(
+      `  ${p.phase.padEnd(40)} ${fmtDur(p.durationMs).padStart(12)}`,
+    );
+  }
+
+  console.log(`  ${dash}`);
+  console.log(`  ${'TOTAL'.padEnd(40)} ${fmtDur(totalMs).padStart(12)}`);
+  console.log(sep);
+  console.log(
+    '\n  NOTE: Wrap with `/usr/bin/time -l` for accurate peak RSS and CPU.',
+  );
+  console.log('  Node.js cannot measure WASM memory.\n');
+}
+
+function writeJsonReport(mode: Mode, sysInfo: SystemInfo) {
+  const totalMs = phases.reduce((s, p) => s + p.durationMs, 0);
+
+  const report = {
+    mode,
+    timestamp: new Date().toISOString(),
+    system: sysInfo,
+    phases: phases.map(p => ({
+      phase: p.phase,
+      durationMs: Math.round(p.durationMs),
+    })),
+    totals: {
+      wallMs: Math.round(totalMs),
+    },
+  };
+
+  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const outPath = resolve(__dirname, `bench-${mode}-${ts}.json`);
+  writeFileSync(outPath, JSON.stringify(report, null, 2) + '\n');
+  console.log(`Benchmark results written to ${outPath}`);
+}
+
+// ─── Main ──────────────────────────────────────────────────────────────
 
 async function main() {
-  console.log('=== Mini ZK-Rollup Proof Pipeline (IVC Chain) ===\n');
+  const arg = process.argv[2];
+  if (arg === '--help' || arg === '-h') {
+    console.log('Usage: yarn prove [ivc|naive]');
+    console.log('  ivc   IVC/Chonk path (default)');
+    console.log('  naive Direct UltraHonk batch verification');
+    process.exit(0);
+  }
 
-  // Initialize Barretenberg
-  console.log('[1/6] Initializing Barretenberg...');
-  const api = await Barretenberg.new({ threads: 4 });
+  const mode: Mode = arg === 'naive' ? 'naive' : 'ivc';
+  const sysInfo = getSystemInfo();
 
-  // Load compiled circuits
-  console.log('[2/6] Loading compiled circuits...');
+  console.log(`=== Mini ZK-Rollup Proof Pipeline (${mode.toUpperCase()}) ===`);
+  console.log(
+    `  ${sysInfo.platform}/${sysInfo.arch} | ${sysInfo.cpuModel.trim()}` +
+    ` (${sysInfo.cpuCores} cores) | ${fmtB(sysInfo.totalMemMb * 1024 * 1024)} RAM\n`,
+  );
+
+  // ─── Common: Initialize ──────────────────────────────────────────
+
+  const api = await timed('Initialize Barretenberg', () =>
+    Barretenberg.new({ threads: 4 }),
+  );
+
+  // ─── Common: Generate 10 client proofs ───────────────────────────
+
+  console.log('\nGenerating 10 client proofs (UltraHonk ZK)...');
   const clientCircuit = loadCircuit('client', 'client_circuit');
+  const clientNoir = new Noir(clientCircuit as any);
+  const clientBackend = new UltraHonkBackend(clientCircuit.bytecode, api);
+
+  const { vkAsFields, vkHash } = await timed(
+    'Client VK generation',
+    async () => {
+      const a = await clientBackend.generateRecursiveProofArtifacts(
+        new Uint8Array(0), 0, { verifierTarget: 'noir-recursive' },
+      );
+      console.log(
+        `    VK: ${a.vkAsFields.length} fields, hash: ${a.vkHash.slice(0, 20)}...`,
+      );
+      return { vkAsFields: a.vkAsFields, vkHash: a.vkHash };
+    },
+  );
+
+  const proofs: string[][] = [];
+  const publicInputs: string[][] = [];
+
+  await timed('Generate 10 client proofs', async () => {
+    for (let i = 0; i < 10; i++) {
+      const x = BigInt(i + 1);
+      const xBytes = hexToBytes(x.toString(16));
+      const yResult = await api.pedersenHash(
+        { inputs: [xBytes], hashIndex: 0 },
+      );
+      const yHex = fieldToHex(yResult.hash);
+
+      const { witness } = await clientNoir.execute({
+        x: '0x' + x.toString(16),
+        y: yHex,
+      });
+
+      const proofData = await clientBackend.generateProof(witness, {
+        verifierTarget: 'noir-recursive',
+      });
+
+      proofs.push(
+        deflattenFields(proofData.proof).map(f => f.toString()),
+      );
+      publicInputs.push(proofData.publicInputs);
+      console.log(`    Proof ${i + 1}/10 done`);
+    }
+  });
+
+  // ─── Common: Compute batch hash ─────────────────────────────────
+
+  const batchHashHex = await timed('Compute batch hash', async () => {
+    const inputs = publicInputs.map(pi => hexToBytes(pi[0]));
+    const result = await api.pedersenHash({ inputs, hashIndex: 0 });
+    const hex = fieldToHex(result.hash);
+    console.log(`    Batch hash: ${hex.slice(0, 20)}...`);
+    return hex;
+  });
+
+  // ─── Branch ──────────────────────────────────────────────────────
+
+  let proofResult: ProofResult;
+  if (mode === 'ivc') {
+    proofResult = await runIvcPath(
+      api, vkAsFields, vkHash, proofs, publicInputs, batchHashHex,
+    );
+  } else {
+    proofResult = await runNaivePath(
+      api, vkAsFields, vkHash, proofs, publicInputs, batchHashHex,
+    );
+  }
+
+  // ─── Contract Interaction ───────────────────────────────────────
+
+  await deployAndVerifyOnChain(proofResult);
+
+  // ─── Summary ─────────────────────────────────────────────────────
+
+  printSummary(mode, sysInfo);
+  writeJsonReport(mode, sysInfo);
+
+  await api.destroy();
+  process.exit(0);
+}
+
+// ─── IVC Path ──────────────────────────────────────────────────────────
+
+async function runIvcPath(
+  api: Barretenberg,
+  vkAsFields: string[],
+  vkHash: string,
+  proofs: string[][],
+  publicInputs: string[][],
+  batchHashHex: string,
+): Promise<ProofResult> {
+  console.log('\n--- IVC Path ---\n');
+
   const batchAppCircuit = loadCircuit('batch_app', 'batch_app');
   const initKernelCircuit = loadCircuit('init_kernel', 'init_kernel');
   const tailKernelCircuit = loadCircuit('tail_kernel', 'tail_kernel');
   const hidingKernelCircuit = loadCircuit('hiding_kernel', 'hiding_kernel');
   const tubeCircuit = loadCircuit('tube', 'tube_circuit');
 
-  // ─── Step 1: Generate 10 client proofs (UltraHonk ZK) ─────────────
-
-  console.log('\n[3/6] Generating 10 client proofs (UltraHonk ZK)...');
-
-  const clientNoir = new Noir(clientCircuit as any);
-  const clientBackend = new UltraHonkBackend(clientCircuit.bytecode, api);
-
-  // Generate VK and VK hash once (same circuit for all proofs)
-  const vkArtifacts = await clientBackend.generateRecursiveProofArtifacts(
-    new Uint8Array(0), 0, { verifierTarget: 'noir-recursive' }
-  );
-  const vkAsFields = vkArtifacts.vkAsFields;
-  const vkHash = vkArtifacts.vkHash;
-
-  console.log(`  VK size: ${vkAsFields.length} fields`);
-  console.log(`  VK hash: ${vkHash}`);
-
-  const proofs: string[][] = [];
-  const publicInputs: string[][] = [];
-
-  for (let i = 0; i < 10; i++) {
-    const x = BigInt(i + 1);
-
-    // Compute y = pedersen_hash([x])
-    const xBytes = hexToBytes(x.toString(16));
-    const yResult = await api.pedersenHash({ inputs: [xBytes], hashIndex: 0 });
-    const yHex = fieldToHex(yResult.hash);
-
-    // Execute and prove
-    const { witness } = await clientNoir.execute({
-      x: '0x' + x.toString(16),
-      y: yHex,
-    });
-
-    const proofData = await clientBackend.generateProof(witness, {
-      verifierTarget: 'noir-recursive',
-    });
-
-    const proofFields = deflattenFields(proofData.proof).map(f => f.toString());
-    proofs.push(proofFields);
-    publicInputs.push(proofData.publicInputs);
-
-    console.log(`  Proof ${i + 1}/10: ${proofFields.length} fields`);
-  }
-
-  console.log(`  All 10 client proofs generated.`);
-
-  // ─── Step 2: Compute batch hash ────────────────────────────────────
-
-  console.log('\n[4/6] Preparing IVC chain...');
-
-  const yValues = publicInputs.map(pi => pi[0]);
-  const pedersenInputs = yValues.map(y => hexToBytes(y));
-  const batchHashResult = await api.pedersenHash({ inputs: pedersenInputs, hashIndex: 0 });
-  const batchHashHex = fieldToHex(batchHashResult.hash);
-  console.log(`  Batch hash: ${batchHashHex.slice(0, 20)}...`);
-
-  // ─── Step 3: Execute IVC chain witness generation ──────────────────
-
-  // Helper: load a precomputed VK file and convert to { key: string[], hash: string }
-  async function loadVkAsFields(circuitName: string): Promise<{ key: string[]; hash: string }> {
-    const vkPath = resolve(__dirname, `../circuits/${circuitName}/target/vk`);
+  async function loadVkAsFields(circuitName: string) {
+    const vkPath = resolve(
+      __dirname, `../circuits/${circuitName}/target/vk`,
+    );
     const vkBytes = readFileSync(vkPath);
     const fields: string[] = [];
     for (let i = 0; i < vkBytes.length; i += 32) {
-      const chunk = vkBytes.slice(i, i + 32);
-      fields.push(fieldToHex(new Uint8Array(chunk)));
+      fields.push(fieldToHex(new Uint8Array(vkBytes.slice(i, i + 32))));
     }
-    // Compute VK hash = poseidon2_hash(fields) — matches barretenberg flavor hash
     const fieldBytes = fields.map(f => hexToBytes(f));
     const hashResult = await api.poseidon2Hash({ inputs: fieldBytes });
-    const hash = fieldToHex(hashResult.hash);
-    console.log(`  Loaded VK for ${circuitName}: ${fields.length} fields, hash=${hash.slice(0, 20)}...`);
-    return { key: fields, hash };
+    return { key: fields, hash: fieldToHex(hashResult.hash) };
   }
 
-  // Load real VKs for kernel witness generation
-  console.log('  Loading precomputed VKs for witness generation...');
-  const batchAppVk = await loadVkAsFields('batch_app');
-  const initKernelVk = await loadVkAsFields('init_kernel');
-  const tailKernelVk = await loadVkAsFields('tail_kernel');
+  const witnesses = await timed('IVC witness generation', async () => {
+    const batchAppVk = await loadVkAsFields('batch_app');
+    const initKernelVk = await loadVkAsFields('init_kernel');
+    const tailKernelVk = await loadVkAsFields('tail_kernel');
 
-  // Execute batch_app (app circuit)
-  console.log('  Executing batch_app circuit...');
-  const batchAppNoir = new Noir(batchAppCircuit as any);
-  const { witness: appWitness, returnValue: appReturnValue } = await batchAppNoir.execute({
-    verification_key: vkAsFields,
-    key_hash: vkHash,
-    proofs: proofs,
-    public_inputs: publicInputs.map(pi => [pi[0]]),
-    batch_hash: batchHashHex,
-  });
-  console.log(`  batch_app witness generated. Return value:`, appReturnValue);
+    const batchAppNoir = new Noir(batchAppCircuit as any);
+    const { witness: appW, returnValue: appRV } =
+      await batchAppNoir.execute({
+        verification_key: vkAsFields,
+        key_hash: vkHash,
+        proofs,
+        public_inputs: publicInputs.map(pi => [pi[0]]),
+        batch_hash: batchHashHex,
+      });
+    console.log('    batch_app witness done');
 
-  // Execute init_kernel (verifies batch_app's OINK proof)
-  console.log('  Executing init_kernel circuit...');
-  const initKernelNoir = new Noir(initKernelCircuit as any);
-  const { witness: initWitness } = await initKernelNoir.execute({
-    app_inputs: appReturnValue,
-    app_vk: batchAppVk,
-  });
-  console.log(`  init_kernel witness generated.`);
+    const initNoir = new Noir(initKernelCircuit as any);
+    const { witness: initW } = await initNoir.execute({
+      app_inputs: appRV,
+      app_vk: batchAppVk,
+    });
+    console.log('    init_kernel witness done');
 
-  // Execute tail_kernel (verifies init_kernel's HN_TAIL proof)
-  console.log('  Executing tail_kernel circuit...');
-  const tailKernelNoir = new Noir(tailKernelCircuit as any);
-  const { witness: tailWitness } = await tailKernelNoir.execute({
-    prev_kernel_inputs: appReturnValue,
-    kernel_vk: initKernelVk,
-  });
-  console.log(`  tail_kernel witness generated.`);
+    const tailNoir = new Noir(tailKernelCircuit as any);
+    const { witness: tailW } = await tailNoir.execute({
+      prev_kernel_inputs: appRV,
+      kernel_vk: initKernelVk,
+    });
+    console.log('    tail_kernel witness done');
 
-  // Execute hiding_kernel (verifies tail_kernel's HN_FINAL proof)
-  console.log('  Executing hiding_kernel circuit...');
-  const hidingKernelNoir = new Noir(hidingKernelCircuit as any);
-  const { witness: hidingWitness } = await hidingKernelNoir.execute({
-    prev_kernel_inputs: appReturnValue,
-    kernel_vk: tailKernelVk,
-  });
-  console.log(`  hiding_kernel witness generated.`);
+    const hidingNoir = new Noir(hidingKernelCircuit as any);
+    const { witness: hidingW } = await hidingNoir.execute({
+      prev_kernel_inputs: appRV,
+      kernel_vk: tailKernelVk,
+    });
+    console.log('    hiding_kernel witness done');
 
-  // ─── Step 4: Prove IVC chain with Chonk ────────────────────────────
-
-  console.log('\n[5/6] Proving IVC chain with Chonk...');
-
-  // Decompress bytecodes
-  const bytecodes = [
-    batchAppCircuit, initKernelCircuit, tailKernelCircuit, hidingKernelCircuit,
-  ].map(c => ungzip(Buffer.from(c.bytecode, 'base64')));
-
-  // Decompress witnesses
-  const witnesses = [appWitness, initWitness, tailWitness, hidingWitness].map(w => ungzip(w));
-
-  // Load VKs pre-computed by `bb write_vk --scheme chonk`
-  // These VKs are IVC-aware (include AppIO/KernelIO public inputs)
-  console.log('  Loading pre-computed VKs...');
-  const circuitNames = ['batch_app', 'init_kernel', 'tail_kernel', 'hiding_kernel'];
-  const vks: Uint8Array[] = circuitNames.map(name => {
-    const vkPath = resolve(__dirname, `../circuits/${name}/target/vk`);
-    const vkData = readFileSync(vkPath);
-    console.log(`  VK ${name}: ${vkData.length} bytes`);
-    return new Uint8Array(vkData);
+    return { app: appW, init: initW, tail: tailW, hiding: hidingW };
   });
 
-  // Prove with Chonk
-  console.log('  Proving with Chonk (this may take a while)...');
-  const chonkApi = await Barretenberg.new({ threads: 4 });
-  const chonkBackend = new AztecClientBackend(bytecodes, chonkApi, circuitNames);
-  const [chonkProofFields, chonkProof, chonkVk] = await chonkBackend.prove(witnesses, vks);
+  const { chonkProofFields, chonkVk } = await timed(
+    'Chonk proving',
+    async () => {
+      const bytecodes = [
+        batchAppCircuit,
+        initKernelCircuit,
+        tailKernelCircuit,
+        hidingKernelCircuit,
+      ].map(c => ungzip(Buffer.from(c.bytecode, 'base64')));
 
-  console.log(`  Chonk proof: ${chonkProofFields.length} fields`);
-  console.log(`  Chonk VK: ${chonkVk.length} bytes`);
+      const witArr = [
+        witnesses.app, witnesses.init, witnesses.tail, witnesses.hiding,
+      ].map(w => ungzip(w));
 
-  // Verify the Chonk proof
-  const chonkValid = await chonkBackend.verify(chonkProof, chonkVk);
-  console.log(`  Chonk verification: ${chonkValid ? 'PASS' : 'FAIL'}`);
+      const circuitNames = [
+        'batch_app', 'init_kernel', 'tail_kernel', 'hiding_kernel',
+      ];
+      const vks = circuitNames.map(name => {
+        const vkPath = resolve(
+          __dirname, `../circuits/${name}/target/vk`,
+        );
+        return new Uint8Array(readFileSync(vkPath));
+      });
 
-  // ─── Step 5: Tube circuit (Chonk -> UltraHonk) ────────────────────
+      const chonkApi = await Barretenberg.new({ threads: 4 });
+      const backend = new AztecClientBackend(
+        bytecodes, chonkApi, circuitNames,
+      );
+      const [proofFields, proof, vk] = await backend.prove(witArr, vks);
 
-  console.log('\n[6/6] Converting Chonk proof to UltraHonk via tube circuit...');
+      const valid = await backend.verify(proof, vk);
+      console.log(
+        `    Chonk proof: ${proofFields.length} fields, ` +
+        `VK: ${vk.length} bytes`,
+      );
+      console.log(
+        `    Chonk verification: ${valid ? 'PASS' : 'FAIL'}`,
+      );
 
-  // Convert chonk proof fields to hex strings
-  const chonkProofAsFields = chonkProofFields.map(f => fieldToHex(f));
-  console.log(`  Chonk proof total fields: ${chonkProofAsFields.length}`);
+      await chonkApi.destroy();
+      return { chonkProofFields: proofFields, chonkVk: vk };
+    },
+  );
 
-  // Split proof: first field is user public input (batch_hash), rest is proof
-  const chonkUserPubInputs = chonkProofAsFields.slice(0, 1);
-  const chonkProofForTube = chonkProofAsFields.slice(1);
-  console.log(`  Chonk user public inputs: ${chonkUserPubInputs.length}, proof: ${chonkProofForTube.length}`);
+  const chonkProofHex = chonkProofFields.map(f => fieldToHex(f));
+  const chonkUserPub = chonkProofHex.slice(0, 1);
+  const chonkProofBody = chonkProofHex.slice(1);
 
-  // Convert chonk VK bytes to field array
   const chonkVkFields: string[] = [];
   for (let i = 0; i < chonkVk.length; i += 32) {
-    const chunk = chonkVk.slice(i, i + 32);
-    chonkVkFields.push(fieldToHex(chunk));
+    chonkVkFields.push(fieldToHex(chonkVk.slice(i, i + 32)));
   }
-  console.log(`  Chonk VK as fields: ${chonkVkFields.length}`);
+  const vkFieldBytes = chonkVkFields.map(f => hexToBytes(f));
+  const keyHashResult = await api.poseidon2Hash({ inputs: vkFieldBytes });
+  const keyHashHex = fieldToHex(keyHashResult.hash);
 
-  // Compute chonk VK hash using poseidon2 (matches barretenberg flavor hash)
-  const chonkVkFieldBytes = chonkVkFields.map(f => hexToBytes(f));
-  const chonkKeyHashResult = await api.poseidon2Hash({ inputs: chonkVkFieldBytes });
-  const chonkKeyHashHex = fieldToHex(chonkKeyHashResult.hash);
-
-  // Prepare tube circuit inputs
-  const tubeInputs = {
-    verification_key: chonkVkFields,
-    proof: chonkProofForTube,
-    chonk_public_inputs: chonkUserPubInputs,
-    key_hash: chonkKeyHashHex,
-    batch_hash: batchHashHex,
-  };
-
-  // Execute tube circuit
-  console.log('  Executing tube circuit...');
   const tubeNoir = new Noir(tubeCircuit as any);
-  const { witness: tubeWitness } = await tubeNoir.execute(tubeInputs);
+  const { witness: tubeWitness } = await tubeNoir.execute({
+    verification_key: chonkVkFields,
+    proof: chonkProofBody,
+    chonk_public_inputs: chonkUserPub,
+    key_hash: keyHashHex,
+    batch_hash: batchHashHex,
+  });
 
-  // Prove with UltraHonk ZK (rollup target for IPA accumulation from Chonk verifier)
-  console.log('  Proving tube with UltraHonk ZK...');
   const tubeBackend = new UltraHonkBackend(tubeCircuit.bytecode, api);
-  const tubeProofData = await tubeBackend.generateProof(tubeWitness, {
-    verifierTarget: 'noir-rollup',
-  });
 
-  console.log(`  Tube proof: ${deflattenFields(tubeProofData.proof).length} fields`);
-  console.log(`  Tube public inputs: ${tubeProofData.publicInputs}`);
+  const { proofFields, publicInputsOut } = await timed(
+    'Tube proving',
+    async () => {
+      const tubeProof = await tubeBackend.generateProof(tubeWitness, {
+        verifierTarget: 'noir-rollup',
+      });
 
-  // Verify tube proof
-  const tubeValid = await tubeBackend.verifyProof(tubeProofData, {
-    verifierTarget: 'noir-rollup',
-  });
-  console.log(`  Tube verification: ${tubeValid ? 'PASS' : 'FAIL'}`);
+      const valid = await tubeBackend.verifyProof(tubeProof, {
+        verifierTarget: 'noir-rollup',
+      });
+      console.log(
+        `    Tube proof: ${deflattenFields(tubeProof.proof).length} fields`,
+      );
+      console.log(
+        `    Tube verification: ${valid ? 'PASS' : 'FAIL'}`,
+      );
 
-  // Get tube VK for the Aztec contract
-  const tubeVkArtifacts = await tubeBackend.generateRecursiveProofArtifacts(
-    new Uint8Array(0), 0, { verifierTarget: 'noir-rollup' }
+      return {
+        proofFields: deflattenFields(tubeProof.proof).map(
+          f => f.toString(),
+        ),
+        publicInputsOut: tubeProof.publicInputs,
+      };
+    },
   );
-  console.log(`  Tube VK hash (for Aztec contract constructor): ${tubeVkArtifacts.vkHash}`);
 
-  // ─── Summary ──────────────────────────────────────────────────────
-
-  console.log('\n=== Pipeline Complete ===');
-  console.log(`  10 client proofs -> Chonk IVC (4 circuits) -> UltraHonk tube proof`);
-  console.log(`  Tube proof can be verified by MiniRollup Aztec contract`);
-  console.log(`  Contract constructor arg (vk_hash): ${tubeVkArtifacts.vkHash}`);
-
-  // Cleanup
-  await api.destroy();
-  await chonkApi.destroy();
-  console.log('\nDone!');
-  process.exit(0);
+  return await timed('Generate tube VK artifacts', async () => {
+    const vkArt = await tubeBackend.generateRecursiveProofArtifacts(
+      new Uint8Array(0), 0, { verifierTarget: 'noir-rollup' },
+    );
+    console.log(`    Tube VK hash (contract arg): ${vkArt.vkHash}`);
+    return {
+      vkFields: vkArt.vkAsFields,
+      vkHash: vkArt.vkHash,
+      proofFields,
+      publicInputs: publicInputsOut,
+    };
+  });
 }
+
+// ─── Naive Path ────────────────────────────────────────────────────────
+
+async function runNaivePath(
+  api: Barretenberg,
+  vkAsFields: string[],
+  vkHash: string,
+  proofs: string[][],
+  publicInputs: string[][],
+  batchHashHex: string,
+): Promise<ProofResult> {
+  console.log('\n--- Naive Path (Direct UltraHonk Batch Verification) ---');
+  console.log('  NOTE: This proves 10 recursive verifications in UltraHonk.');
+  console.log('  Expect high memory usage and long proving time.\n');
+
+  const circuit = loadCircuit('batch_verifier', 'batch_verifier');
+
+  const batchWitness = await timed(
+    'Batch verifier execution',
+    async () => {
+      const noir = new Noir(circuit as any);
+      const { witness } = await noir.execute({
+        verification_key: vkAsFields,
+        key_hash: vkHash,
+        proofs,
+        public_inputs: publicInputs.map(pi => [pi[0]]),
+        batch_hash: batchHashHex,
+      });
+      return witness;
+    },
+  );
+
+  const backend = new UltraHonkBackend(circuit.bytecode, api);
+
+  const { proofFields, publicInputsOut } = await timed(
+    'Batch verifier proving (UltraHonk)',
+    async () => {
+      const proof = await backend.generateProof(batchWitness, {
+        verifierTarget: 'noir-recursive',
+      });
+
+      const fields = deflattenFields(proof.proof);
+      console.log(`    Proof: ${fields.length} fields`);
+      console.log(`    Public inputs: ${proof.publicInputs}`);
+
+      const valid = await backend.verifyProof(proof, {
+        verifierTarget: 'noir-recursive',
+      });
+      console.log(`    Verification: ${valid ? 'PASS' : 'FAIL'}`);
+
+      return {
+        proofFields: fields.map(f => f.toString()),
+        publicInputsOut: proof.publicInputs,
+      };
+    },
+  );
+
+  return await timed('Generate VK artifacts', async () => {
+    const vkArt = await backend.generateRecursiveProofArtifacts(
+      new Uint8Array(0), 0, { verifierTarget: 'noir-recursive' },
+    );
+    console.log(`    VK hash (contract arg): ${vkArt.vkHash}`);
+    return {
+      vkFields: vkArt.vkAsFields,
+      vkHash: vkArt.vkHash,
+      proofFields,
+      publicInputs: publicInputsOut,
+    };
+  });
+}
+
+// ─── Contract Interaction ──────────────────────────────────────────────
+
+async function deployAndVerifyOnChain(proof: ProofResult) {
+  console.log('\n--- On-Chain Verification ---\n');
+
+  const { wallet, account } = await timed(
+    'Connect to sandbox',
+    async () => {
+      const node = createAztecNodeClient(SANDBOX_URL);
+      await waitForNode(node);
+      const w = await NodeEmbeddedWallet.create(SANDBOX_URL);
+      const accounts =
+        await registerInitialLocalNetworkAccountsInWallet(w);
+      const addr = accounts[0];
+      console.log(`    Connected to ${SANDBOX_URL}`);
+      console.log(`    Account: ${addr}`);
+      return { wallet: w, account: addr };
+    },
+  );
+
+  const contractArtifactPath = resolve(
+    __dirname, '../contract/target/MiniRollup-MiniRollup.json',
+  );
+  const artifact = loadContractArtifact(
+    JSON.parse(readFileSync(contractArtifactPath, 'utf-8')),
+  );
+
+  const contract = await timed(
+    'Deploy MiniRollup contract',
+    async () => {
+      const deployer = Contract.deploy(
+        wallet as any, artifact, [proof.vkHash],
+      );
+      await deployer.simulate({ from: account });
+      await deployer.send({
+        from: account,
+        wait: { timeout: 120 },
+      });
+      const addr = deployer.address!;
+      console.log(`    Deployed at: ${addr}`);
+      return await Contract.at(addr, artifact, wallet as any);
+    },
+  );
+
+  await timed('Call verify_batch', async () => {
+    const tx = contract.methods.verify_batch(
+      proof.vkFields,
+      proof.proofFields,
+      proof.publicInputs,
+    );
+    await tx.simulate({ from: account });
+    const receipt = await tx.send({
+      from: account,
+      wait: { timeout: 120 },
+    });
+    console.log(`    TX hash: ${receipt.txHash}`);
+    console.log(`    Status: ${receipt.status}`);
+  });
+}
+
+// ─── Entry ─────────────────────────────────────────────────────────────
 
 main().catch(err => {
   console.error('Pipeline failed:', err);

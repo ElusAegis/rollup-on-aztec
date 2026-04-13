@@ -3,12 +3,11 @@ use bb_proof_verification::{
 };
 use std::hash::pedersen_hash;
 
-/// Batch verifier circuit: verifies 10 UltraHonk ZK proofs from the client circuit
-/// and outputs a hash of all verified public inputs.
+/// Naive batch verifier: verifies 10 UltraHonk ZK proofs directly in a single
+/// UltraHonk circuit. Outputs batch_hash as a public output.
 ///
-/// This circuit is intended to be proved with Chonk (via AztecClientBackend),
-/// which makes the recursive UltraHonk verification dramatically cheaper
-/// due to native non-native EC group operations in MegaHonk.
+/// This is the simple/naive approach -- contrast with the IVC path (batch_app +
+/// kernel chain + tube) which uses Chonk for cheaper recursive verification.
 fn main(
     // All 10 proofs use the same VK (same circuit), so we only need one copy
     verification_key: UltraHonkVerificationKey,

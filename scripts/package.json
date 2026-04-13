@@ -2,15 +2,22 @@
   "name": "mini-rollup-scripts",
   "type": "module",
   "scripts": {
-    "prove": "tsx prove_e2e.ts"
+    "prove": "tsx prove_e2e.ts",
+    "prove:ivc": "tsx prove_e2e.ts ivc",
+    "prove:naive": "tsx prove_e2e.ts naive"
   },
   "dependencies": {
+    "@aztec/accounts": "4.0.0-devnet.2-patch.1",
+    "@aztec/aztec.js": "4.0.0-devnet.2-patch.1",
     "@aztec/bb.js": "4.0.0-devnet.2-patch.1",
     "@aztec/noir-noir_js": "4.0.0-devnet.2-patch.1",
+    "@aztec/wallets": "4.0.0-devnet.2-patch.1",
+    "pako": "^2.1.0",
     "tsx": "^4.20.6"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "@types/pako": "^2.0.4",
     "typescript": "^5.0.0"
   }
 }
