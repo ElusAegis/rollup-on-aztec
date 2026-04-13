@@ -3,11 +3,8 @@ use bb_proof_verification::{
 };
 use std::hash::pedersen_hash;
 
-/// Naive batch verifier: verifies 10 UltraHonk ZK proofs directly in a single
-/// UltraHonk circuit. Outputs batch_hash as a public output.
-///
-/// This is the simple/naive approach -- contrast with the IVC path (batch_app +
-/// kernel chain + tube) which uses Chonk for cheaper recursive verification.
+/// Direct recursive verifier: verifies 10 UltraHonk ZK proofs in a single
+/// UltraHonk circuit without IVC. Outputs batch_hash as a public output.
 fn main(
     // All 10 proofs use the same VK (same circuit), so we only need one copy
     verification_key: UltraHonkVerificationKey,

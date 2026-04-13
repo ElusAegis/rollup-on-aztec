@@ -4,7 +4,7 @@
   "scripts": {
     "prove": "tsx prove_e2e.ts",
     "prove:ivc": "tsx prove_e2e.ts ivc",
-    "prove:naive": "tsx prove_e2e.ts naive"
+    "prove:direct": "tsx prove_e2e.ts direct"
   },
   "dependencies": {
     "@aztec/accounts": "4.0.0-devnet.2-patch.1",

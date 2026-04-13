@@ -1,3 +1,8 @@
 node_modules/
 circuits/*/target/
+contract/target/
 scripts/bench-*.json
+scripts/.pnp.*
+scripts/.yarn/
+scripts/pxe_data_*/
+scripts/wallet_data_*/

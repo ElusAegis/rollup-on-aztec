@@ -3,9 +3,9 @@
  *
  * Two proving modes:
  *   ivc   – 4-circuit IVC chain proved with Chonk, then UltraHonk tube (default)
- *   naive – Direct batch verification in a single UltraHonk circuit
+ *   direct – Direct recursive verification in a single UltraHonk circuit
  *
- * Usage: yarn prove [ivc|naive]
+ * Usage: yarn prove [ivc|direct]
  *
  * Wrap with `/usr/bin/time -l` for accurate peak RSS and CPU usage —
  * Node.js process.memoryUsage() cannot see WASM memory.
@@ -33,7 +33,7 @@ import {
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-type Mode = 'ivc' | 'naive';
+type Mode = 'ivc' | 'direct';
 
 interface ProofResult {
   vkFields: string[];
@@ -182,13 +182,13 @@ function writeJsonReport(mode: Mode, sysInfo: SystemInfo) {
 async function main() {
   const arg = process.argv[2];
   if (arg === '--help' || arg === '-h') {
-    console.log('Usage: yarn prove [ivc|naive]');
-    console.log('  ivc   IVC/Chonk path (default)');
-    console.log('  naive Direct UltraHonk batch verification');
+    console.log('Usage: yarn prove [ivc|direct]');
+    console.log('  ivc    IVC/Chonk path (default)');
+    console.log('  direct Direct recursive UltraHonk verification');
     process.exit(0);
   }
 
-  const mode: Mode = arg === 'naive' ? 'naive' : 'ivc';
+  const mode: Mode = arg === 'direct' ? 'direct' : 'ivc';
   const sysInfo = getSystemInfo();
 
   console.log(`=== Mini ZK-Rollup Proof Pipeline (${mode.toUpperCase()}) ===`);
@@ -270,7 +270,7 @@ async function main() {
       api, vkAsFields, vkHash, proofs, publicInputs, batchHashHex,
     );
   } else {
-    proofResult = await runNaivePath(
+    proofResult = await runDirectPath(
       api, vkAsFields, vkHash, proofs, publicInputs, batchHashHex,
     );
   }
@@ -467,9 +467,9 @@ async function runIvcPath(
   });
 }
 
-// ─── Naive Path ────────────────────────────────────────────────────────
+// ─── Direct Path ───────────────────────────────────────────────────────
 
-async function runNaivePath(
+async function runDirectPath(
   api: Barretenberg,
   vkAsFields: string[],
   vkHash: string,
@@ -477,14 +477,13 @@ async function runNaivePath(
   publicInputs: string[][],
   batchHashHex: string,
 ): Promise<ProofResult> {
-  console.log('\n--- Naive Path (Direct UltraHonk Batch Verification) ---');
-  console.log('  NOTE: This proves 10 recursive verifications in UltraHonk.');
-  console.log('  Expect high memory usage and long proving time.\n');
+  console.log('\n--- Direct Path (Recursive UltraHonk Verification) ---');
+  console.log('  Verifies 10 proofs directly in a single UltraHonk circuit.\n');
 
-  const circuit = loadCircuit('batch_verifier', 'batch_verifier');
+  const circuit = loadCircuit('direct_verifier', 'direct_verifier');
 
   const batchWitness = await timed(
-    'Batch verifier execution',
+    'Direct verifier execution',
     async () => {
       const noir = new Noir(circuit as any);
       const { witness } = await noir.execute({
@@ -501,7 +500,7 @@ async function runNaivePath(
   const backend = new UltraHonkBackend(circuit.bytecode, api);
 
   const { proofFields, publicInputsOut } = await timed(
-    'Batch verifier proving (UltraHonk)',
+    'Direct verifier proving (UltraHonk)',
     async () => {
       const proof = await backend.generateProof(batchWitness, {
         verifierTarget: 'noir-recursive',
