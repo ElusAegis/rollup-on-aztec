@@ -594,6 +594,53 @@ async function deployAndVerifyOnChain(proof: ProofResult) {
     console.log(`    TX hash: ${receipt.txHash}`);
     console.log(`    Status: ${receipt.status}`);
   });
+
+  await timed('Sanity check: invalid proof rejection', async () => {
+    const corrupted = [...proof.proofFields];
+    const indices = [
+      0,
+      Math.floor(corrupted.length / 2),
+      corrupted.length - 1,
+    ];
+    for (const idx of indices) {
+      corrupted[idx] = '0xff' + corrupted[idx].slice(4);
+    }
+
+    const tx = contract.methods.verify_batch(
+      proof.vkFields, corrupted, proof.publicInputs,
+    );
+
+    let simPassed = false;
+    try {
+      await tx.simulate({ from: account });
+      simPassed = true;
+      console.log(
+        '    Simulate with corrupted proof: passed' +
+        ' (expected -- PXE does not run verifier)',
+      );
+    } catch {
+      console.log('    Simulate with corrupted proof: rejected');
+    }
+
+    if (simPassed) {
+      try {
+        const receipt = await tx.send({
+          from: account, wait: { timeout: 120 },
+        });
+        console.log(
+          `    WARNING: corrupted proof ACCEPTED on-chain` +
+          ` (status: ${receipt.status})`,
+        );
+        console.log(
+          '    This suggests verify_honk_proof may not be executing.',
+        );
+      } catch {
+        console.log('    Corrupted proof rejected on-chain: PASS');
+      }
+    } else {
+      console.log('    Corrupted proof rejected at simulation: PASS');
+    }
+  });
 }
 
 // ─── Entry ─────────────────────────────────────────────────────────────
