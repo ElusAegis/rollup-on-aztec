@@ -277,7 +277,7 @@ async function main() {
 
   // ─── Contract Interaction ───────────────────────────────────────
 
-  await deployAndVerifyOnChain(proofResult);
+  await deployAndVerifyOnChain(proofResult, mode);
 
   // ─── Summary ─────────────────────────────────────────────────────
 
@@ -538,8 +538,25 @@ async function runDirectPath(
 
 // ─── Contract Interaction ──────────────────────────────────────────────
 
-async function deployAndVerifyOnChain(proof: ProofResult) {
+async function deployAndVerifyOnChain(proof: ProofResult, mode: Mode) {
   console.log('\n--- On-Chain Verification ---\n');
+
+  if (mode === 'ivc') {
+    console.log(
+      '  SKIPPED: IVC tube proof uses noir-rollup target (519 fields)',
+    );
+    console.log(
+      '  which produces a RollupHonkProof. The contract uses',
+    );
+    console.log(
+      '  verify_honk_proof (UltraHonkZKProof, 500 fields).',
+    );
+    console.log(
+      '  verify_rolluphonk_proof is not supported in Aztec private',
+    );
+    console.log('  functions (MegaBuilder limitation).\n');
+    return;
+  }
 
   const { wallet, account } = await timed(
     'Connect to sandbox',
@@ -586,13 +603,26 @@ async function deployAndVerifyOnChain(proof: ProofResult) {
       proof.proofFields,
       proof.publicInputs,
     );
-    await tx.simulate({ from: account });
+    const simResult: any = await tx.simulate({
+      from: account, includeMetadata: true,
+    });
+    if (simResult.estimatedGas) {
+      const g = simResult.estimatedGas.gasLimits;
+      const t = simResult.estimatedGas.teardownGasLimits;
+      console.log(
+        `    Estimated gas: DA=${g.daGas} L2=${g.l2Gas}` +
+        ` (teardown: DA=${t.daGas} L2=${t.l2Gas})`,
+      );
+    }
     const receipt = await tx.send({
       from: account,
       wait: { timeout: 120 },
     });
     console.log(`    TX hash: ${receipt.txHash}`);
     console.log(`    Status: ${receipt.status}`);
+    if (receipt.transactionFee !== undefined) {
+      console.log(`    Transaction fee: ${receipt.transactionFee}`);
+    }
   });
 
   await timed('Sanity check: invalid proof rejection', async () => {

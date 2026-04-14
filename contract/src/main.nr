@@ -19,7 +19,7 @@ pub contract MiniRollup {
         self.storage.vk_hash.initialize(vk_hash);
     }
 
-    /// Verifies a batch proof from the mini-rollup tube circuit.
+    /// Verifies a batch proof from the mini-rollup.
     /// The proof attests that 10 client preimage proofs were valid.
     /// public_inputs[0] = batch_hash (poseidon2 hash of all 10 y-values)
     #[external("private")]
